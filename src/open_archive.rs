@@ -513,21 +513,37 @@ impl<M: ProcessMode> Internal<M> {
         let user_data = unsafe { &mut *(user_data as *mut Userdata<M::Output>) };
         match msg {
             native::UCM_CHANGEVOLUMEW => {
-                // Guard against null OR misaligned pointers. libunrar should pass
-                // a valid, aligned wide-string pointer here, but at volume-boundary
-                // crossings it can hand us null or a non-null pointer that is not
-                // aligned to `WideChar` (u32 on Unix, u16 on Windows).
-                // `from_ptr_truncate` copies via `ptr::copy_nonoverlapping`, whose
-                // safety precondition requires the source to be non-null AND aligned;
-                // violating it is UB and aborts the process under debug pointer
-                // checks. Skip in that case — libunrar still locates the next volume
-                // by path, and the `RAR_VOL_ASK => -1` stop path below is preserved.
+                // libunrar hands us a nul-terminated wide string naming the next
+                // volume, but at volume-boundary crossings it can pass null or a
+                // non-null pointer not aligned to `WideChar` (u32 on Unix, u16 on
+                // Windows). Two hazards must be guarded:
+                //   1. Null / misaligned `p` — reading through it is UB.
+                //   2. Over-reading. `from_ptr_truncate(p, 2048)` eagerly builds a
+                //      2048-element slice and bulk-copies it via
+                //      `ptr::copy_nonoverlapping` BEFORE truncating at the nul, so it
+                //      reads up to 8 KiB past the (often much shorter) volume-name
+                //      buffer. Under the debug pointer checks in current toolchains
+                //      that copy aborts the process (SIGABRT), even when `p` itself
+                //      is non-null and aligned.
+                // Instead, scan element-by-element up to the 2048 bound (unrar's
+                // buffer size / max path length since RAR 5.00), stopping at the nul
+                // terminator, so we never read past it. If `p` is unusable we skip;
+                // libunrar still locates the next volume by path and the
+                // `RAR_VOL_ASK => -1` stop path below is preserved.
                 let p = p1 as *const widestring::WideChar;
                 if !p.is_null() && (p as usize) % std::mem::align_of::<widestring::WideChar>() == 0 {
-                    // 2048 seems to be the buffer size in unrar,
-                    // also it's the maximum path length since 5.00.
-                    let next = unsafe { widestring::WideCString::from_ptr_truncate(p, 2048) };
-                    user_data.1 = Some(next);
+                    let mut chars: Vec<widestring::WideChar> = Vec::new();
+                    for i in 0..2048usize {
+                        // SAFETY: `p` is non-null and aligned; each element up to and
+                        // including the nul terminator lies within unrar's volume-name
+                        // buffer, and we stop at the terminator without over-reading.
+                        let ch = unsafe { p.add(i).read() };
+                        if ch == 0 {
+                            break;
+                        }
+                        chars.push(ch);
+                    }
+                    user_data.1 = Some(widestring::WideCString::from_vec_truncate(chars));
                 }
                 match p2 {
                     // Next volume not found. -1 means stop
