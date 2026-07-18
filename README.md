@@ -1,56 +1,55 @@
 # newtua-unrar
 
-Вынужденный форк крейта [`unrar`](https://github.com/muja/unrar.rs) — Rust-обвязка
-над `libunrar` для чтения и распаковки RAR-архивов. Используется проектом
-[newtua](https://github.com/new-the-unarchiver) как обычная зависимость по имени
-библиотеки `unrar` (потребители кода ничего не меняют).
+A forced fork of [`unrar`](https://github.com/muja/unrar.rs) — the Rust
+wrapper around `libunrar` for reading and extracting RAR archives. Used by
+[newtua](https://github.com/new-the-unarchiver) as a plain dependency under
+the library name `unrar`, so nothing changes for code that consumes it.
 
-## Это вынужденный форк
+## This is a forced fork
 
-Он существует не как самостоятельный продукт: мы его **не развиваем**, **не
-принимаем в него посторонние правки** и **не даём обещаний по сопровождению**.
+It exists to unblock our own build, not as a product of its own. We do **not
+develop it**, do **not accept outside changes**, and make **no maintenance
+promises**.
 
-**Происхождение:** [muja/unrar.rs](https://github.com/muja/unrar.rs), версия 0.5.8,
-лицензия `MIT OR Apache-2.0`.
+**Upstream:** [muja/unrar.rs](https://github.com/muja/unrar.rs), version 0.5.8, licence `MIT OR Apache-2.0`.
 
-**Причина форка:** в обратный вызов libunrar добавлены защиты от опасных
-указателей: `UCM_PROCESSDATA` может передать нулевой буфер, а
-`UCM_CHANGEVOLUMEW` может передать нулевой или невыровненный указатель на имя
-тома — а если наивно скопировать по этому указателю фиксированное число
-символов, то ещё и прочитать за границей буфера при переходе между томами.
-Без этих проверок распаковка многотомных архивов завершает процесс через
-SIGABRT.
+**Why the fork exists:** libunrar's callback can hand us dangerous pointers —
+a null buffer for `UCM_PROCESSDATA`, or a null/misaligned volume-name pointer
+for `UCM_CHANGEVOLUMEW` that, if copied naively for a fixed number of
+characters, also over-reads past the buffer at volume boundaries — and
+without guarding against them, extracting multi-volume archives aborts the
+process with SIGABRT.
 
-Мы откажемся от этого форка и вернёмся на исходный крейт, как только тот начнёт
-удовлетворять нашим требованиям. Если вам нужен этот код сам по себе — берите
-исходный крейт, а не наш форк.
+We will drop this fork and go back to the upstream crate as soon as upstream
+meets our needs. If you want this code for its own sake, take the upstream
+crate, not our fork.
 
-Правка отправлена в апстрим: [muja/unrar.rs#77](https://github.com/muja/unrar.rs/pull/77).
-**Внимание:** в том виде, в каком запрос отправлен, он содержит только защиту
-от нулевого и невыровненного указателя — защита от переполнения чтения
-появилась у нас позже и в запрос ещё не внесена. Форк будет удалён, когда
-апстрим примет полную версию правки и выпустит её.
+The fix has been submitted upstream: [muja/unrar.rs#77](https://github.com/muja/unrar.rs/pull/77).
+**Note:** as submitted, that PR only guards against a null/misaligned
+pointer — the over-read guard was added later on our side and hasn't been
+folded into the PR yet. The fork goes away once upstream accepts the full fix
+and cuts a release with it.
 
-## Что именно исправлено
+## What's actually fixed
 
-**Целевой крейт:** `unrar` (репозиторий muja/unrar.rs), версия 0.5.8.
+**Target crate:** `unrar` (muja/unrar.rs), version 0.5.8.
 
-### Проблема
+### The problem
 
-Обработка **многотомного RAR**-архива может завершить весь процесс через
-`SIGABRT` на границе тома. Наблюдались два разных отказа, оба в
+Handling a **multi-volume RAR** archive can abort the whole process with
+`SIGABRT` at a volume boundary. We saw two distinct failures, both inside
 `Internal::callback`:
 
-1. **Распаковка** стабильно падает с `SIGABRT`, когда данные файла пересекают
-   границу тома (нулевой указатель в `UCM_PROCESSDATA`).
-2. **Листинг/распаковка** *периодически* падает с `SIGABRT` при смене тома —
-   из-за того, как исходный код читает широкую строку с именем следующего
-   тома в `UCM_CHANGEVOLUMEW`.
+1. **Extraction** reliably crashes with `SIGABRT` when a file's data crosses
+   a volume boundary (a null pointer in `UCM_PROCESSDATA`).
+2. **Listing/extraction** *intermittently* crashes with `SIGABRT` on volume
+   changes, caused by how the original code reads the wide string naming the
+   next volume in `UCM_CHANGEVOLUMEW`.
 
-### Причина
+### Root cause
 
-В `Internal::callback` (`src/open_archive.rs`) исходный (неисправленный) код
-для `UCM_CHANGEVOLUMEW` выглядел так:
+In `Internal::callback` (`src/open_archive.rs`), the original (unpatched)
+code for `UCM_CHANGEVOLUMEW` looked like this:
 
 ```rust
 let next =
@@ -58,41 +57,41 @@ let next =
 user_data.1 = Some(next);
 ```
 
-Здесь два независимых источника UB, и защититься нужно от обеих:
+There are two independent sources of undefined behavior here, and both need
+guarding against:
 
-1. **Нулевой/невыровненный указатель.** `from_ptr_truncate` копирует через
-   `ptr::copy_nonoverlapping`, чьё требование безопасности — источник должен
-   быть **не null** и **выровнен** по `widestring::WideChar` (`u32` на Unix,
-   `u16` на Windows). При смене тома libunrar может передать именно такой
-   указатель.
-2. **Переполнение чтения.** Даже если указатель не null и выровнен,
-   `from_ptr_truncate(p, 2048)` сначала **безусловно копирует все 2048
-   элементов** через `ptr::copy_nonoverlapping` и только потом обрезает
-   результат по нулевому терминатору. Реальный буфер имени тома почти всегда
-   короче 2048 символов, так что этот вызов читает до 8 КиБ за его
-   границей — и это происходит, даже если указатель сам по себе абсолютно
-   корректен. Одной только проверки на null/выравнивание для этой опасности
-   недостаточно.
+1. **Null/misaligned pointer.** `from_ptr_truncate` copies via
+   `ptr::copy_nonoverlapping`, whose safety contract requires the source to
+   be **non-null** and **aligned** to `widestring::WideChar` (`u32` on Unix,
+   `u16` on Windows). At a volume change, libunrar can pass exactly such a
+   pointer.
+2. **Over-read.** Even when the pointer is non-null and aligned,
+   `from_ptr_truncate(p, 2048)` first **unconditionally copies all 2048
+   elements** via `ptr::copy_nonoverlapping`, and only *then* truncates the
+   result at the nul terminator. The real volume-name buffer is almost
+   always shorter than 2048 characters, so this call reads up to 8 KiB past
+   its end — and it does so even when the pointer itself is perfectly valid.
+   A null/alignment check alone doesn't cover this hazard.
 
-`UCM_PROCESSDATA`: `std::ptr::slice_from_raw_parts(p1, p2)` + `&*raw_slice`
-строится даже когда `p1` равен null или `p2 <= 0`. Создание Rust-ссылки из
-нулевого указателя — undefined behaviour **даже для среза нулевой длины**
-(`p1` здесь `*const u8`, выравнивание 1, значит важны только null/размер).
+For `UCM_PROCESSDATA`: `std::ptr::slice_from_raw_parts(p1, p2)` +
+`&*raw_slice` gets built even when `p1` is null or `p2 <= 0`. Building a Rust
+reference from a null pointer is undefined behavior **even for a zero-length
+slice** (`p1` here is `*const u8`, alignment 1, so only null/size matter).
 
-Возникающее UB перехватывается рантайм-проверками Rust (debug assertions /
-nightly) и превращается в непробрасываемую панику через границу C++ FFI →
-`SIGABRT`. Вариант `UCM_CHANGEVOLUMEW` зависит от тайминга/раскладки памяти,
-поэтому проявляется периодически (например, только при параллельном запуске
-тестов).
+The resulting UB gets caught by Rust's runtime pointer checks (debug
+assertions / nightly) and turns into a panic that can't unwind across the C++
+FFI boundary, so it becomes `SIGABRT`. The `UCM_CHANGEVOLUMEW` case depends on
+timing/memory layout, which is why it only shows up intermittently — e.g.
+only under parallel test runs.
 
-### Исправление (текущий код форка, `src/open_archive.rs`, ~514–556)
+### The fix (current fork code, `src/open_archive.rs`, ~514-556)
 
-Проверка null/выравнивания сама по себе не закрывает вторую опасность —
-`from_ptr_truncate` всё равно копирует фиксированные 2048 элементов раньше,
-чем обрежет по нулю. Поэтому в форке `from_ptr_truncate` для
-`UCM_CHANGEVOLUMEW` вообще не используется: строка читается посимвольно в
-цикле, который останавливается на нулевом терминаторе, — так гарантированно
-не читается ничего за пределами реального буфера.
+A null/alignment check by itself doesn't close the second hole —
+`from_ptr_truncate` still copies a fixed 2048 elements before truncating at
+the nul. So the fork doesn't use `from_ptr_truncate` at all for
+`UCM_CHANGEVOLUMEW`: it reads the string one character at a time in a loop
+that stops at the nul terminator, guaranteeing it never reads past the real
+buffer.
 
 ```rust
 native::UCM_CHANGEVOLUMEW => {
@@ -149,34 +148,33 @@ native::UCM_PROCESSDATA => {
 }
 ```
 
-Защиты консервативны:
+Both guards are conservative:
 
-- Пропуск нулевого/невыровненного `UCM_CHANGEVOLUMEW` лишь не сохраняет имя
-  следующего тома; libunrar всё равно находит тома по пути, а путь остановки
-  `RAR_VOL_ASK → -1` сохранён.
-- Пропуск нулевого/пустого чанка `UCM_PROCESSDATA` не теряет ничего реального
-  (у настоящего чанка `p1 != null` и `p2 > 0`).
+- Skipping a null/misaligned `UCM_CHANGEVOLUMEW` only means we don't record
+  the next volume's name; libunrar still finds volumes by path, and the
+  `RAR_VOL_ASK → -1` stop path is preserved.
+- Skipping a null/empty `UCM_PROCESSDATA` chunk never drops real data (a
+  genuine chunk always has `p1 != null` and `p2 > 0`).
 
-### Воспроизведение
+### Reproducing it
 
-Создайте многотомный RAR (`rar a -ma4 -v2k arc.rar bigfile`) и обработайте
-первый том через API крейта на сборке с debug assertions (проверки
-предусловий указателей в Rust nightly):
+Create a multi-volume RAR (`rar a -ma4 -v2k arc.rar bigfile`) and process the
+first volume through the crate's API on a build with debug assertions
+(pointer-precondition checks on Rust nightly):
 
-- Без защиты `UCM_PROCESSDATA` — `SIGABRT` при пересечении границы тома
-  полезной нагрузкой (переход в `arc.part2.rar`).
-- Без проверки null/выравнивания в `UCM_CHANGEVOLUMEW` — периодический
-  `SIGABRT` при смене тома (легче воспроизводится при параллельном запуске
-  тестов).
-- Если оставить проверку null/выравнивания, но по-прежнему вызывать
-  `from_ptr_truncate(p, 2048)` вместо посимвольного сканирования, —
-  `SIGABRT` от переполнения чтения тоже возможен: указатель валиден, но
-  реальный буфер имени тома короче 2048 символов, а копирование фиксированной
-  длины уходит за его границу.
+- Without the `UCM_PROCESSDATA` guard — `SIGABRT` when file payload crosses a
+  volume boundary (moving into `arc.part2.rar`).
+- Without the null/alignment check in `UCM_CHANGEVOLUMEW` — intermittent
+  `SIGABRT` on volume change (easier to reproduce with parallel test runs).
+- Keeping the null/alignment check but still calling
+  `from_ptr_truncate(p, 2048)` instead of the character-by-character scan —
+  `SIGABRT` from the over-read is still possible: the pointer is valid, but
+  the real volume-name buffer is shorter than 2048 characters, and the
+  fixed-length copy runs past its end.
 
-Только с обеими защитами — и с посимвольным сканированием вместо
-`from_ptr_truncate` в `UCM_CHANGEVOLUMEW` — листинг и распаковка проходят
-корректно.
+Only with both guards in place — and the character-by-character scan instead
+of `from_ptr_truncate` in `UCM_CHANGEVOLUMEW` — do listing and extraction
+work correctly.
 
-`unrar_sys` остаётся на версии 0.5.8 без изменений — меняется только
-безопасная Rust-обвязка.
+`unrar_sys` stays on 0.5.8, unchanged — only the safe Rust wrapper is
+different.
