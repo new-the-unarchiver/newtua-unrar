@@ -2,8 +2,9 @@
 
 A forced fork of [`unrar`](https://github.com/muja/unrar.rs) — the Rust
 wrapper around `libunrar` for reading and extracting RAR archives. Used by
-[newtua](https://github.com/new-the-unarchiver) as a plain dependency under
-the library name `unrar`, so nothing changes for code that consumes it.
+[New The Unarchiver](https://github.com/new-the-unarchiver) (`newtua`) as a plain
+dependency under the library name `unrar`, so nothing changes for code that
+consumes it.
 
 ## This is a forced fork
 
